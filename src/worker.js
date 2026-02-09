@@ -1,53 +1,49 @@
-// backroom-bot worker.js (Cloudflare Worker)
-// ✅ Добавлено: GET /lobby (для сайта), OPTIONS (CORS), улучшена устойчивость к “слёту” переменных
-
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // -------- CORS preflight (на всякий случай) --------
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers: corsHeaders(),
-      });
-    }
+    // CORS preflight
+    if (request.method === "OPTIONS") return new Response("", { status: 204, headers: cors() });
 
-    // -------- API для сайта: статус лобби --------
-    // GET https://<your-worker>.workers.dev/lobby  ->  { openUntil: number, open: boolean, now: number }
-    if (request.method === "GET" && url.pathname === "/lobby") {
+    // ---------- Public API for website ----------
+    if (request.method === "GET" && url.pathname === "/state") {
       const st = await getLobby(env);
-      const open = lobbyIsOpen(st);
-      return json(
-        {
-          openUntil: Number(st.openUntil || 0),
-          open,
-          now: Date.now(),
-        },
-        200
-      );
+      return json(publicLobbyState(st), 200, cors());
     }
 
-    // (опционально) хелсчек
-    if (request.method === "GET" && url.pathname === "/") {
-      return new Response("OK", { status: 200 });
+    if (request.method === "GET" && url.pathname === "/track/current") {
+      const cur = await getCurrentTrack(env);
+      return json(cur || { ok: false }, 200, cors());
     }
 
-    // -------- Telegram webhook --------
+    if (request.method === "GET" && url.pathname === "/tracks") {
+      const limit = Math.max(1, Math.min(50, Number(url.searchParams.get("limit") || 10)));
+      const list = await getTracks(env);
+      return json({ ok: true, items: list.slice(-limit).reverse() }, 200, cors());
+    }
+
+    // health
+    if (request.method === "GET") {
+      return new Response("OK", { status: 200, headers: cors() });
+    }
+
+    // ---------- Telegram webhook ----------
     if (request.method !== "POST") {
-      return new Response("Method not allowed", { status: 405 });
+      return new Response("Method not allowed", { status: 405, headers: cors() });
     }
 
     const update = await request.json().catch(() => null);
-    if (!update) return new Response("Bad JSON", { status: 400 });
+    if (!update) return new Response("Bad JSON", { status: 400, headers: cors() });
 
     ctx.waitUntil(handleUpdate(update, env));
-    return new Response("OK", { status: 200 });
+    return new Response("OK", { status: 200, headers: cors() });
   },
 };
 
-// ---------- helpers ----------
-function corsHeaders() {
+/* =========================
+   Utils
+========================= */
+function cors() {
   return {
     "access-control-allow-origin": "*",
     "access-control-allow-methods": "GET,POST,OPTIONS",
@@ -55,24 +51,21 @@ function corsHeaders() {
     "cache-control": "no-store",
   };
 }
-
-function json(obj, status = 200) {
+function json(obj, status = 200, headers = {}) {
   return new Response(JSON.stringify(obj), {
     status,
-    headers: { "content-type": "application/json; charset=utf-8", ...corsHeaders() },
+    headers: { "content-type": "application/json; charset=utf-8", ...headers },
   });
 }
-
+function now() {
+  return Date.now();
+}
 function isAdmin(env, id) {
   const admin = String(env.ADMIN_ID || "").trim();
   return admin && String(id) === admin;
 }
-
 async function tg(env, method, payload) {
-  const token = String(env.BOT_TOKEN || "").trim();
-  if (!token) throw new Error("BOT_TOKEN is missing in env");
-
-  const url = `https://api.telegram.org/bot${token}/${method}`;
+  const url = `https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`;
   const res = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -83,27 +76,28 @@ async function tg(env, method, payload) {
   return data.result;
 }
 
-// ---------- KV keys ----------
-const LOBBY_KEY = "lobby:state"; // { openUntil:number (ms) }
+/* =========================
+   KV Keys
+========================= */
+const LOBBY_KEY = "lobby:state"; // { openUntil:number(ms) }
 const UI_KEY = (adminId) => `ui:${adminId}`; // { chatId, msgId, screen }
+const PENDING_KEY = (adminId) => `pending:${adminId}`; // { type:"open_custom"|"rename_track", ... }
 const STATS_KEY = "stats:global"; // { startsTotal, uniqueUsers, startsToday, dayStamp }
 const SEEN_KEY = (userId) => `seen:${userId}`;
+const TRACKS_KEY = "tracks:index"; // array of {id,title,url,createdAt,isPublic,isCurrent,durationSec?}
+const CURRENT_TRACK_KEY = "tracks:current"; // trackId
 
-// ---------- Lobby helpers ----------
-function now() {
-  return Date.now();
-}
-
+/* =========================
+   Lobby
+========================= */
 async function getLobby(env) {
   const raw = await env.KV.get(LOBBY_KEY);
   const st = raw ? JSON.parse(raw) : { openUntil: 0 };
   return { openUntil: Number(st.openUntil || 0) };
 }
-
 function lobbyIsOpen(st) {
   return Number(st.openUntil || 0) > now();
 }
-
 function fmtUntil(ts) {
   if (!ts) return "—";
   const d = new Date(ts);
@@ -113,41 +107,143 @@ function fmtUntil(ts) {
   const mo = String(d.getMonth() + 1).padStart(2, "0");
   return `${dd}.${mo} ${hh}:${mm}`;
 }
+function publicLobbyState(st) {
+  const open = lobbyIsOpen(st);
+  return {
+    ok: true,
+    isOpen: open,
+    openUntil: st.openUntil || 0,
+    // для твоего старого app.js совместимость:
+    reopenAt: open ? null : (st.openUntil ? new Date(st.openUntil).toISOString() : null),
+    windowId: open ? "OPEN" : "CLOSED",
+    now: now(),
+  };
+}
+async function setLobby(env, openUntil) {
+  await env.KV.put(LOBBY_KEY, JSON.stringify({ openUntil: Number(openUntil || 0) }));
+}
 
-// ---------- Keyboards ----------
-function kbUser(env, lobbyOpen) {
-  if (!lobbyOpen) {
+/* =========================
+   Stats
+========================= */
+function dayStamp() {
+  const d = new Date();
+  return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+}
+async function getStats(env) {
+  const raw = await env.KV.get(STATS_KEY);
+  const st = raw
+    ? JSON.parse(raw)
+    : { startsTotal: 0, uniqueUsers: 0, startsToday: 0, dayStamp: dayStamp() };
+
+  const today = dayStamp();
+  if (st.dayStamp !== today) {
+    st.dayStamp = today;
+    st.startsToday = 0;
+  }
+  return st;
+}
+async function bumpStatsOnStart(env, userId) {
+  const st = await getStats(env);
+  st.startsTotal += 1;
+  st.startsToday += 1;
+
+  const seen = await env.KV.get(SEEN_KEY(userId));
+  if (!seen) {
+    st.uniqueUsers += 1;
+    await env.KV.put(SEEN_KEY(userId), "1");
+  }
+  await env.KV.put(STATS_KEY, JSON.stringify(st));
+}
+
+/* =========================
+   Tracks (R2 + KV)
+========================= */
+function stripExt(name) {
+  return String(name || "").replace(/\.[a-z0-9]+$/i, "");
+}
+function safeKey(s) {
+  return String(s || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\-_ ]/gu, "")
+    .replace(/\s+/g, "-")
+    .slice(0, 60) || "track";
+}
+function guessExt(contentType, path) {
+  const p = (path || "").toLowerCase();
+  if (p.endsWith(".mp3") || contentType.includes("mpeg")) return ".mp3";
+  if (p.endsWith(".wav") || contentType.includes("wav")) return ".wav";
+  if (p.endsWith(".m4a") || contentType.includes("mp4")) return ".m4a";
+  if (p.endsWith(".ogg") || contentType.includes("ogg")) return ".ogg";
+  return "";
+}
+
+async function getTracks(env) {
+  const raw = await env.KV.get(TRACKS_KEY);
+  return raw ? JSON.parse(raw) : [];
+}
+async function putTracks(env, arr) {
+  await env.KV.put(TRACKS_KEY, JSON.stringify(arr));
+}
+async function getCurrentTrack(env) {
+  const tracks = await getTracks(env);
+  const curId = await env.KV.get(CURRENT_TRACK_KEY);
+  if (!curId) return tracks.slice().reverse().find((t) => t.isPublic) || null;
+  return tracks.find((t) => t.id === curId) || null;
+}
+async function setCurrentTrack(env, trackId) {
+  const tracks = await getTracks(env);
+  let found = false;
+  for (const t of tracks) {
+    t.isCurrent = t.id === trackId;
+    if (t.isCurrent) found = true;
+  }
+  if (found) {
+    await env.KV.put(CURRENT_TRACK_KEY, trackId);
+    await putTracks(env, tracks);
+  }
+  return found;
+}
+
+async function uploadTelegramAudioToR2(env, fileId, title) {
+  const fileInfo = await tg(env, "getFile", { file_id: fileId });
+  const path = fileInfo.file_path;
+  const tgFileUrl = `https://api.telegram.org/file/bot${env.BOT_TOKEN}/${path}`;
+
+  const res = await fetch(tgFileUrl);
+  if (!res.ok) throw new Error("Failed to download from Telegram");
+
+  const contentType = res.headers.get("content-type") || "application/octet-stream";
+  const ext = guessExt(contentType, path);
+  const key = `tracks/${Date.now()}-${safeKey(title)}${ext}`;
+
+  const bytes = await res.arrayBuffer();
+  await env.R2.put(key, bytes, { httpMetadata: { contentType } });
+
+  const base = String(env.R2_PUBLIC_BASE || "").replace(/\/+$/, "");
+  const publicUrl = base ? `${base}/${key}` : key;
+
+  return { key, publicUrl, contentType };
+}
+
+/* =========================
+   Telegram UI
+========================= */
+function kbUser(env, open) {
+  if (!open) {
     return { inline_keyboard: [[{ text: "🔒 Лобби закрыто", callback_data: "noop" }]] };
   }
-  const web = String(env.WEBAPP_URL || "").trim();
-  return { inline_keyboard: [[{ text: "🚪 Открыть BACKROOM", url: web }]] };
+  return { inline_keyboard: [[{ text: "🚪 Открыть BACKROOM", url: env.WEBAPP_URL }]] };
 }
 
 function kbAdminMain() {
   return {
     inline_keyboard: [
-      [{ text: "🟢 Лобби: управление", callback_data: "screen:lobby" }],
+      [{ text: "🟢 Лобби", callback_data: "screen:lobby" }],
+      [{ text: "🎵 Треки", callback_data: "screen:tracks" }],
       [{ text: "📊 Статистика", callback_data: "screen:stats" }],
       [{ text: "⚙️ Помощь", callback_data: "screen:help" }],
-    ],
-  };
-}
-
-function kbAdminLobby(st) {
-  const open = lobbyIsOpen(st);
-  return {
-    inline_keyboard: [
-      [
-        {
-          text: open ? "🔴 Закрыть лобби" : "🟢 Открыть лобби",
-          callback_data: open ? "lobby:close" : "lobby:open:900",
-        },
-      ],
-      [{ text: "⏱ Открыть на 15 мин", callback_data: "lobby:open:900" }],
-      [{ text: "⏱ Открыть на 1 час", callback_data: "lobby:open:3600" }],
-      [{ text: "⏱ Открыть на 3 часа", callback_data: "lobby:open:10800" }],
-      [{ text: "⏱ Открыть на 12 часов", callback_data: "lobby:open:43200" }],
-      [{ text: "⬅️ Назад", callback_data: "screen:main" }],
     ],
   };
 }
@@ -156,7 +252,44 @@ function kbAdminBack() {
   return { inline_keyboard: [[{ text: "⬅️ Назад", callback_data: "screen:main" }]] };
 }
 
-// ---------- UI rendering ----------
+function kbAdminLobby(st) {
+  const open = lobbyIsOpen(st);
+  return {
+    inline_keyboard: [
+      [
+        { text: open ? "🔴 Закрыть" : "🟢 Открыть на 1 час", callback_data: open ? "lobby:close" : "lobby:open:3600" },
+      ],
+      [
+        { text: "⏱ 15 минут", callback_data: "lobby:open:900" },
+        { text: "⏱ 3 часа", callback_data: "lobby:open:10800" },
+      ],
+      [
+        { text: "⏱ 12 часов", callback_data: "lobby:open:43200" },
+        { text: "🕒 До конца дня", callback_data: "lobby:open:today" },
+      ],
+      [{ text: "✍️ Ввести минуты", callback_data: "lobby:open:custom" }],
+      [{ text: "⬅️ Назад", callback_data: "screen:main" }],
+    ],
+  };
+}
+
+async function kbAdminTracks(env) {
+  const cur = await getCurrentTrack(env);
+  const curLine = cur ? `🎧 Сейчас: ${cur.title || cur.id}` : "🎧 Сейчас: —";
+  return {
+    inline_keyboard: [
+      [{ text: "➕ Загрузить новый трек", callback_data: "track:upload" }],
+      [{ text: "⭐ Сделать последнюю загрузку текущей", callback_data: "track:setlast" }],
+      [{ text: "📜 Список (10)", callback_data: "track:list" }],
+      [{ text: "⬅️ Назад", callback_data: "screen:main" }],
+      [{ text: curLine, callback_data: "noop" }],
+    ],
+  };
+}
+
+/* =========================
+   Render Admin in ONE message
+========================= */
 async function renderAdmin(env, adminId, chatId, screen, msgId = null) {
   const lobby = await getLobby(env);
   const open = lobbyIsOpen(lobby);
@@ -168,8 +301,17 @@ async function renderAdmin(env, adminId, chatId, screen, msgId = null) {
     text =
       `🟢 Лобби: ${open ? "ОТКРЫТО" : "ЗАКРЫТО"}\n` +
       `⏰ До: ${open ? fmtUntil(lobby.openUntil) : "—"}\n\n` +
-      `Выбери действие:`;
+      `Управление:`;
     reply_markup = kbAdminLobby(lobby);
+  }
+
+  if (screen === "tracks") {
+    const cur = await getCurrentTrack(env);
+    text =
+      `🎵 Треки\n\n` +
+      `🎧 Текущий на сайте: ${cur ? (cur.title || cur.id) : "—"}\n\n` +
+      `Загрузка делается прямо сюда: пришли mp3/wav/m4a как Audio или File.`;
+    reply_markup = await kbAdminTracks(env);
   }
 
   if (screen === "stats") {
@@ -185,14 +327,14 @@ async function renderAdmin(env, adminId, chatId, screen, msgId = null) {
   if (screen === "help") {
     text =
       `⚙️ Помощь\n\n` +
-      `• Лобби открывается на время кнопками\n` +
-      `• Пользователи видят кнопку входа только когда лобби открыто\n` +
-      `• Меню не спамит — редактируется одно сообщение\n\n` +
-      `Проверка API для сайта: /lobby`;
+      `• Лобби меняется кнопками в разделе "Лобби"\n` +
+      `• Сайт каждые 1с читает /state у воркера\n` +
+      `• Треки: загружаешь в боте → они появляются на сайте в плеере\n` +
+      `• Меню не спамит — редактируется одно сообщение\n`;
     reply_markup = kbAdminBack();
   }
 
-  // if have msgId -> edit, else send
+  // edit or send
   if (msgId) {
     await tg(env, "editMessageText", {
       chat_id: chatId,
@@ -209,45 +351,14 @@ async function renderAdmin(env, adminId, chatId, screen, msgId = null) {
   }
 }
 
-// ---------- Stats ----------
-function dayStamp() {
-  const d = new Date();
-  return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
-}
-
-async function getStats(env) {
-  const raw = await env.KV.get(STATS_KEY);
-  const st = raw
-    ? JSON.parse(raw)
-    : { startsTotal: 0, uniqueUsers: 0, startsToday: 0, dayStamp: dayStamp() };
-
-  const today = dayStamp();
-  if (st.dayStamp !== today) {
-    st.dayStamp = today;
-    st.startsToday = 0;
-  }
-  return st;
-}
-
-async function bumpStatsOnStart(env, userId) {
-  const st = await getStats(env);
-  st.startsTotal += 1;
-  st.startsToday += 1;
-
-  const seen = await env.KV.get(SEEN_KEY(userId));
-  if (!seen) {
-    st.uniqueUsers += 1;
-    await env.KV.put(SEEN_KEY(userId), "1");
-  }
-
-  await env.KV.put(STATS_KEY, JSON.stringify(st));
-}
-
-// ---------- Update handler ----------
+/* =========================
+   Main Update Handler
+========================= */
 async function handleUpdate(update, env) {
   const msg = update.message || update.edited_message;
   const cb = update.callback_query;
 
+  // ---- callback buttons
   if (cb) {
     const fromId = cb.from?.id;
     const chatId = cb.message?.chat?.id;
@@ -256,21 +367,21 @@ async function handleUpdate(update, env) {
 
     await tg(env, "answerCallbackQuery", { callback_query_id: cb.id }).catch(() => {});
 
-    // no-op for users
     if (data === "noop") return;
 
-    // Admin only
+    // non-admin
     if (!isAdmin(env, fromId)) {
       const lobby = await getLobby(env);
+      const open = lobbyIsOpen(lobby);
       await tg(env, "sendMessage", {
         chat_id: chatId,
-        text: lobbyIsOpen(lobby) ? "BACKROOM открыт 👇" : "Лобби сейчас закрыто 🔒",
-        reply_markup: kbUser(env, lobbyIsOpen(lobby)),
+        text: open ? "BACKROOM открыт 👇" : "Лобби сейчас закрыто 🔒",
+        reply_markup: kbUser(env, open),
       });
       return;
     }
 
-    // screen navigation
+    // screens
     if (data.startsWith("screen:")) {
       const screen = data.split(":")[1] || "main";
       await env.KV.put(UI_KEY(fromId), JSON.stringify({ chatId, msgId, screen }));
@@ -278,18 +389,74 @@ async function handleUpdate(update, env) {
       return;
     }
 
-    // lobby actions
+    // lobby
     if (data === "lobby:close") {
-      await env.KV.put(LOBBY_KEY, JSON.stringify({ openUntil: 0 }));
+      await setLobby(env, 0);
       await renderAdmin(env, fromId, chatId, "lobby", msgId);
+      return;
+    }
+
+    if (data === "lobby:open:today") {
+      const d = new Date();
+      d.setHours(23, 59, 59, 999);
+      await setLobby(env, d.getTime());
+      await renderAdmin(env, fromId, chatId, "lobby", msgId);
+      return;
+    }
+
+    if (data === "lobby:open:custom") {
+      await env.KV.put(PENDING_KEY(fromId), JSON.stringify({ type: "open_custom", chatId, msgId }));
+      await tg(env, "sendMessage", {
+        chat_id: chatId,
+        text: "Напиши одним сообщением на сколько минут открыть (например: 45)",
+      });
       return;
     }
 
     if (data.startsWith("lobby:open:")) {
       const sec = Number(data.split(":")[2] || 0);
       const openUntil = now() + sec * 1000;
-      await env.KV.put(LOBBY_KEY, JSON.stringify({ openUntil }));
+      await setLobby(env, openUntil);
       await renderAdmin(env, fromId, chatId, "lobby", msgId);
+      return;
+    }
+
+    // tracks
+    if (data === "track:list") {
+      const items = (await getTracks(env)).slice(-10).reverse();
+      const text =
+        items.length === 0
+          ? "Пока треков нет."
+          : items
+              .map((t, i) => {
+                const cur = t.isCurrent ? " ⭐CURRENT" : "";
+                const pub = t.isPublic ? " PUBLIC" : " PRIVATE";
+                return `${i + 1}) ${t.title || t.id}${cur}\n${t.url}\n${new Date(t.createdAt).toLocaleString()}${pub}`;
+              })
+              .join("\n\n");
+      await tg(env, "sendMessage", { chat_id: chatId, text });
+      return;
+    }
+
+    if (data === "track:setlast") {
+      const arr = await getTracks(env);
+      const last = arr[arr.length - 1];
+      if (!last) {
+        await tg(env, "sendMessage", { chat_id: chatId, text: "Нет треков." });
+        return;
+      }
+      last.isPublic = true;
+      await putTracks(env, arr);
+      await setCurrentTrack(env, last.id);
+      await renderAdmin(env, fromId, chatId, "tracks", msgId);
+      return;
+    }
+
+    if (data === "track:upload") {
+      await tg(env, "sendMessage", {
+        chat_id: chatId,
+        text: "Ок. Пришли аудиофайл (mp3/wav/m4a) как Audio или File. Название можешь написать в подписи.",
+      });
       return;
     }
 
@@ -300,44 +467,100 @@ async function handleUpdate(update, env) {
 
   const chatId = msg.chat?.id;
   const fromId = msg.from?.id;
-  const text = (msg.text || "").trim();
+  const text = (msg.text || msg.caption || "").trim();
 
-  // /start stats
-  if (text.startsWith("/start")) {
+  // /start
+  if ((msg.text || "").trim().startsWith("/start")) {
     await bumpStatsOnStart(env, fromId);
 
     if (isAdmin(env, fromId)) {
-      // reuse last admin message if exists
       const uiRaw = await env.KV.get(UI_KEY(fromId));
       const ui = uiRaw ? JSON.parse(uiRaw) : null;
-
-      // if already have panel message -> edit it, else send new
       await renderAdmin(env, fromId, chatId, ui?.screen || "main", ui?.msgId || null);
       return;
     }
 
     const lobby = await getLobby(env);
+    const open = lobbyIsOpen(lobby);
     await tg(env, "sendMessage", {
       chat_id: chatId,
-      text: lobbyIsOpen(lobby) ? "BACKROOM 👇" : "Лобби закрыто 🔒",
-      reply_markup: kbUser(env, lobbyIsOpen(lobby)),
+      text: open ? "BACKROOM 👇" : "Лобби закрыто 🔒",
+      reply_markup: kbUser(env, open),
     });
     return;
   }
 
-  // Non-admin: always show current state
+  // pending text input (admin)
+  if (isAdmin(env, fromId) && msg.text) {
+    const pendingRaw = await env.KV.get(PENDING_KEY(fromId));
+    if (pendingRaw) {
+      const p = JSON.parse(pendingRaw);
+      await env.KV.delete(PENDING_KEY(fromId));
+
+      if (p.type === "open_custom") {
+        const minutes = Number((msg.text || "").trim());
+        if (!Number.isFinite(minutes) || minutes <= 0 || minutes > 24 * 60) {
+          await tg(env, "sendMessage", { chat_id: chatId, text: "Нужно число минут (1..1440)." });
+        } else {
+          await setLobby(env, now() + minutes * 60 * 1000);
+          await renderAdmin(env, fromId, p.chatId || chatId, "lobby", p.msgId || null);
+        }
+        return;
+      }
+    }
+  }
+
+  // admin: upload audio
+  if (isAdmin(env, fromId)) {
+    const file =
+      msg.audio ||
+      (msg.document && msg.document.mime_type?.startsWith("audio/") ? msg.document : null);
+
+    if (file) {
+      const title = (msg.caption || "").trim() || stripExt(file.file_name || "untitled");
+      const up = await uploadTelegramAudioToR2(env, file.file_id, title);
+
+      const track = {
+        id: up.key,
+        title,
+        url: up.publicUrl,
+        createdAt: now(),
+        isPublic: true,
+        isCurrent: false,
+      };
+
+      const arr = await getTracks(env);
+      arr.push(track);
+      await putTracks(env, arr);
+
+      await setCurrentTrack(env, track.id);
+
+      await tg(env, "sendMessage", {
+        chat_id: chatId,
+        text: `✅ Залил и поставил текущим!\n\n🎵 ${track.title}\n${track.url}`,
+      });
+
+      const uiRaw = await env.KV.get(UI_KEY(fromId));
+      const ui = uiRaw ? JSON.parse(uiRaw) : null;
+      await renderAdmin(env, fromId, chatId, ui?.screen || "tracks", ui?.msgId || null);
+      return;
+    }
+  }
+
+  // non-admin: всегда показываем текущий статус
   if (!isAdmin(env, fromId)) {
     const lobby = await getLobby(env);
+    const open = lobbyIsOpen(lobby);
     await tg(env, "sendMessage", {
       chat_id: chatId,
-      text: lobbyIsOpen(lobby) ? "BACKROOM 👇" : "Лобби закрыто 🔒",
-      reply_markup: kbUser(env, lobbyIsOpen(lobby)),
+      text: open ? "BACKROOM 👇" : "Лобби закрыто 🔒",
+      reply_markup: kbUser(env, open),
     });
     return;
   }
 
-  // Admin: if пишет "меню" — открыть панель
-  if (text.toLowerCase().includes("меню") || text === "/admin") {
+  // admin: /admin или "меню"
+  if ((msg.text || "").trim() === "/admin" || (msg.text || "").toLowerCase().includes("меню")) {
     const uiRaw = await env.KV.get(UI_KEY(fromId));
     const ui = uiRaw ? JSON.parse(uiRaw) : null;
     await renderAdmin(env, fromId, chatId, ui?.screen || "main", ui?.msgId || null);
