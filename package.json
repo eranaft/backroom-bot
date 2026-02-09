@@ -1,0 +1,11 @@
+{
+  "name": "backroom-bot",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "grammy": "^1.35.0"
+  },
+  "scripts": {
+    "deploy": "wrangler deploy"
+  }
+}
