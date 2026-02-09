@@ -19,6 +19,22 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
+const url = new URL(request.url);
+
+// ✅ сайт читает статус
+if (request.method === "GET" && url.pathname === "/lobby") {
+  const raw = await env.KV.get("lobby:status");
+  const data = raw ? JSON.parse(raw) : { open: false, until: 0, updatedAt: 0 };
+  return new Response(JSON.stringify(data), {
+    status: 200,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "access-control-allow-origin": "*",
+      "cache-control": "no-store",
+    },
+  });
+}
+
     // --- Public endpoints for your webapp ---
     if (request.method === "GET" && url.pathname === "/status") {
       const st = await getLobbyStatus(env);
