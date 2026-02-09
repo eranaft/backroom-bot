@@ -1,20 +1,19 @@
 import { Bot, InlineKeyboard, webhookCallback } from "grammy";
 
 /**
- * Secrets (Cloudflare → Worker → Settings → Variables → Secrets):
- * BOT_TOKEN
- * ADMIN_ID   (твой telegram id числом)
- * WEBAPP_URL (ссылка на BACKROOM сайт)
- * R2_PUBLIC_BASE (твоя public base, например https://pub-....r2.dev)
- *
  * Bindings:
- * KV  (KV namespace)
- * R2  (R2 bucket binding)
+ * - env.R2  (R2 bucket binding name)
+ * - env.KV  (KV namespace binding name)
+ * Secrets (Workers -> Settings -> Variables):
+ * - BOT_TOKEN
+ * - ADMIN_ID
+ * - WEBAPP_URL
+ * - R2_PUBLIC_BASE
  */
 
-function isAdmin(ctx, env) {
+function isAdmin(env, ctx) {
   const adminId = Number(env.ADMIN_ID || 0);
-  const fromId = Number(ctx.from?.id || 0);
+  const fromId = ctx?.from?.id ? Number(ctx.from.id) : 0;
   return adminId && fromId === adminId;
 }
 
@@ -22,163 +21,107 @@ function kbUser(env) {
   return new InlineKeyboard().url("Открыть BACKROOM", env.WEBAPP_URL);
 }
 
-function kbAdminMain() {
+function kbAdminMain(env) {
   return new InlineKeyboard()
     .text("⬆️ Загрузить (черновик)", "up:draft")
     .text("🚀 Загрузить (паблик)", "up:pub")
     .row()
-    .text("📚 Список треков", "list")
-    .text("⚙️ Команды", "help");
+    .text("📄 Список треков", "list")
+    .text("🧠 Помощь", "help");
 }
 
 function safeName(s) {
   return String(s || "")
     .trim()
-    .replace(/[^\p{L}\p{N}\s._-]+/gu, "")
+    .replace(/[^\p{L}\p{N}\-._()\s]/gu, "")
     .replace(/\s+/g, " ")
     .slice(0, 80);
 }
 
-async function kvGetJson(env, key, fallback) {
-  const raw = await env.KV.get(key);
-  if (!raw) return fallback;
-  try { return JSON.parse(raw); } catch { return fallback; }
-}
-async function kvPutJson(env, key, value) {
-  await env.KV.put(key, JSON.stringify(value));
-}
+// Ленивая инициализация: создаём бота только когда env уже доступен
+let _bot = null;
+function getBot(env) {
+  if (_bot) return _bot;
 
-async function addTrack(env, track) {
-  const list = await kvGetJson(env, "tracks", []);
-  list.unshift(track);
-  await kvPutJson(env, "tracks", list);
-}
-
-async function listTracksText(env) {
-  const list = await kvGetJson(env, "tracks", []);
-  if (!list.length) return "Пока пусто.";
-  return list.slice(0, 30).map((t, i) => {
-    const tag = t.visibility === "public" ? "🌍" : "📝";
-    return `${i+1}) ${tag} ${t.title} — ${t.r2Key}`;
-  }).join("\n");
-}
-
-/** Telegram file download → R2 upload */
-async function uploadTelegramAudioToR2(ctx, env, visibility) {
-  // ждём аудио/документ
-  const msg = ctx.message;
-  const file =
-    msg?.audio ||
-    msg?.document ||
-    msg?.voice ||
-    null;
-
-  if (!file) {
-    await ctx.reply("Пришли аудио (mp3) файлом или как audio.");
-    return;
+  const token = (env.BOT_TOKEN || "").trim();
+  if (!token) {
+    // чтобы не падало “втихаря”
+    throw new Error("BOT_TOKEN is missing (set it in Worker secrets)");
   }
 
-  const fileId = file.file_id;
-  const tg = `https://api.telegram.org/bot${env.BOT_TOKEN}`;
+  const bot = new Bot(token);
 
-  // 1) getFile
-  const gf = await fetch(`${tg}/getFile?file_id=${encodeURIComponent(fileId)}`);
-  const gfJson = await gf.json();
-  if (!gfJson.ok) throw new Error("getFile failed");
-  const filePath = gfJson.result.file_path;
-
-  // 2) download file (stream)
-  const dlUrl = `https://api.telegram.org/file/bot${env.BOT_TOKEN}/${filePath}`;
-  const dl = await fetch(dlUrl);
-  if (!dl.ok) throw new Error("download failed");
-
-  // 3) determine key
-  const ext = (file.file_name && file.file_name.includes(".")) ? file.file_name.split(".").pop() : "mp3";
-  const title = safeName(msg?.caption || file.file_name || "track");
-  const ts = Date.now();
-  const r2Key = `${visibility}/${ts}-${title}.${ext}`.replace(/\s/g, "_");
-
-  // 4) upload to R2
-  const contentType = dl.headers.get("content-type") || "audio/mpeg";
-  await env.R2.put(r2Key, dl.body, { httpMetadata: { contentType } });
-
-  const publicUrl = env.R2_PUBLIC_BASE
-    ? `${env.R2_PUBLIC_BASE.replace(/\/+$/, "")}/${r2Key}`
-    : `(нет R2_PUBLIC_BASE)`;
-
-  await addTrack(env, {
-    id: String(ts),
-    title,
-    visibility: visibility === "public" ? "public" : "draft",
-    r2Key,
-    url: publicUrl,
-    createdAt: new Date(ts).toISOString(),
+  bot.command("start", async (ctx) => {
+    if (isAdmin(env, ctx)) {
+      await ctx.reply(
+        "Админ-панель: выбери действие 👇",
+        { reply_markup: kbAdminMain(env) }
+      );
+    } else {
+      await ctx.reply(
+        "Добро пожаловать в BACKROOM.",
+        { reply_markup: kbUser(env) }
+      );
+    }
   });
 
-  await ctx.reply(
-    `✅ Загружено!\n` +
-    `• ${visibility === "public" ? "Паблик" : "Черновик"}\n` +
-    `• key: ${r2Key}\n` +
-    `• url: ${publicUrl}`
-  );
+  bot.callbackQuery("help", async (ctx) => {
+    if (!isAdmin(env, ctx)) return ctx.answerCallbackQuery({ text: "Нет доступа" });
+
+    await ctx.answerCallbackQuery();
+    await ctx.reply(
+      [
+        "Команды (только для тебя):",
+        "/start — меню",
+        "⬆️ Загрузить (черновик) — загрузка и сохранение как draft",
+        "🚀 Загрузить (паблик) — загрузка и публикация",
+        "📄 Список треков — покажу, что лежит в базе",
+        "",
+        "Пользователям — только кнопка «Открыть BACKROOM».",
+      ].join("\n")
+    );
+  });
+
+  bot.callbackQuery("list", async (ctx) => {
+    if (!isAdmin(env, ctx)) return ctx.answerCallbackQuery({ text: "Нет доступа" });
+
+    await ctx.answerCallbackQuery();
+
+    // Пока заглушка — позже сделаем реальный список из KV
+    await ctx.reply("Список треков: (позже подключим KV/R2 индексацию)");
+  });
+
+  // TODO: позже добавим “пришли файл -> я загружу в R2”
+  bot.callbackQuery(/up:(draft|pub)/, async (ctx) => {
+    if (!isAdmin(env, ctx)) return ctx.answerCallbackQuery({ text: "Нет доступа" });
+
+    const mode = ctx.match?.[1];
+    await ctx.answerCallbackQuery();
+    await ctx.reply(
+      `Ок. Режим: ${mode}. Пришли мне аудио-файл (mp3) и подписью: название/артист/описание.\n` +
+      `Пример: "Track 03 — KRAMSKOY | demo | 128bpm"`
+    );
+  });
+
+  _bot = bot;
+  return bot;
 }
 
-const bot = new Bot(""); // token подставим в fetch()
-
-bot.command("start", async (ctx) => {
-  const env = ctx.env;
-  if (isAdmin(ctx, env)) {
-    await ctx.reply("Админ-панель BACKROOM (только для тебя).", { reply_markup: kbAdminMain() });
-  } else {
-    await ctx.reply("BACKROOM.", { reply_markup: kbUser(env) });
-  }
-});
-
-bot.callbackQuery(["help"], async (ctx) => {
-  await ctx.answerCallbackQuery();
-  await ctx.reply(
-    "Команды (админ):\n" +
-    "/start — меню\n" +
-    "⬆️ Загрузить (черновик/паблик) — пришли файл после нажатия\n" +
-    "📚 Список треков — покажет последние\n"
-  );
-});
-
-bot.callbackQuery(["list"], async (ctx) => {
-  await ctx.answerCallbackQuery();
-  const text = await listTracksText(ctx.env);
-  await ctx.reply("Треки:\n" + text);
-});
-
-bot.callbackQuery(/^up:(draft|pub)$/, async (ctx) => {
-  await ctx.answerCallbackQuery();
-  if (!isAdmin(ctx, ctx.env)) return;
-  const mode = ctx.match[1];
-  const visibility = mode === "pub" ? "public" : "draft";
-  await ctx.reply(
-    `Ок. Пришли сейчас файл (mp3) одним сообщением.\nРежим: ${visibility === "public" ? "ПАБЛИК" : "ЧЕРНОВИК"}`
-  );
-  await ctx.env.KV.put("await_upload", JSON.stringify({ chatId: ctx.chat.id, visibility }), { expirationTtl: 300 });
-});
-
-// ловим сообщения с файлами только от админа и только если "ожидаем загрузку"
-bot.on("message", async (ctx) => {
-  const env = ctx.env;
-  if (!isAdmin(ctx, env)) return;
-
-  const raw = await env.KV.get("await_upload");
-  if (!raw) return;
-  let st;
-  try { st = JSON.parse(raw); } catch { st = null; }
-  if (!st || st.chatId !== ctx.chat.id) return;
-
-  await env.KV.delete("await_upload");
-  await uploadTelegramAudioToR2(ctx, env, st.visibility);
-});
-
+// webhook handler
 export default {
   async fetch(request, env, ctx) {
-    bot.token = env.BOT_TOKEN;
-    return webhookCallback(bot, "cloudflare-mod")(request, env, ctx);
-  },
+    try {
+      // принимаем апдейты и на / и на /webhook
+      const url = new URL(request.url);
+      if (request.method === "GET") return new Response("OK");
+      if (request.method === "POST" && (url.pathname === "/" || url.pathname === "/webhook")) {
+        const bot = getBot(env);
+        const handle = webhookCallback(bot, "cloudflare-mod");
+        return handle(request);
+      }
+      return new Response("Not found", { status: 404 });
+    } catch (e) {
+      return new Response(String(e?.message || e), { status: 500 });
+    }
+  }
 };
