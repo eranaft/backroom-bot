@@ -1,0 +1,17 @@
+name = "backroom-bot"
+main = "src/worker.js"
+compatibility_date = "2026-02-09"
+
+# чтобы некоторые node-шные штуки работали, если вдруг понадобятся
+compatibility_flags = ["nodejs_compat"]
+
+# KV (название привязки будет KV)
+# bindings лучше добавить в UI, но можно и тут:
+# [[kv_namespaces]]
+# binding = "KV"
+# id = "..."
+
+# R2 (привязка будет R2)
+# [[r2_buckets]]
+# binding = "R2"
+# bucket_name = "backroom-tracks"
